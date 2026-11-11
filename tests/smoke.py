@@ -9,6 +9,7 @@ from uuid import uuid4
 
 base = sys.argv[1].rstrip('/')
 enabled = '--disabled' not in sys.argv[2:]
+reverb = '--reverb' in sys.argv[2:]
 
 def request(path, token=None, data=None, expected=200):
     if base == 'kernel':
@@ -51,6 +52,10 @@ family = request('/families', mt, {'baby_name': 'Baby'}, 201)
 path = '/families/' + family['id']
 request(path + '/status', ot, expected=404)
 request(path + '/sync', mt, {'cursor': 0, 'changes': []}, 403)
+if reverb:
+    auth_path = path + '/realtime/auth'
+    socket = {'socket_id': '123.456'}
+    request(auth_path, mt, socket, 403)
 if not enabled:
     request(path + '/billing/test-activate', mt, {}, 404)
     print('Verified: test upgrade and sync disabled outside the opted-in test environment.')
@@ -59,6 +64,12 @@ assert request(path + '/billing/test-activate', mt, {})['sync_enabled']
 invite = request(path + '/invites', mt, {})
 joined = request('/invites/redeem', pt, {'code': invite['code']})
 assert len(joined['members']) == 2
+if reverb:
+    assert joined['realtime']['key'], joined
+    request(auth_path, data=socket, expected=401)
+    request(auth_path, ot, socket, 404)
+    request(auth_path, pt, {'socket_id': 'invalid'}, 422)
+    assert request(auth_path, pt, socket)['auth'].startswith(joined['realtime']['key'] + ':')
 request('/invites/redeem', ot, {'code': invite['code']}, 422)
 request(path + '/billing/test-activate', pt, {}, 403)
 feed_id, diaper_id, sleep_id = uid(), uid(), uid()

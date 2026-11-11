@@ -5,12 +5,14 @@ namespace App;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Broadcast;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use stdClass;
+use Throwable;
 
 final class HandoffApi
 {
@@ -78,6 +80,17 @@ final class HandoffApi
         return $this->familyState($row, $request->user()->id);
     }
 
+    public function realtimeAuth(Request $request, string $family): array
+    {
+        abort_unless($this->reverbKey(), 404);
+        $row = $this->memberFamily($family, $request->user()->id);
+        $this->requireSync($row);
+        $data = $request->validate(['socket_id'=>'required|string|max:64|regex:/^\d+\.\d+$/D']);
+
+        return json_decode(Broadcast::connection('reverb')->getPusher()
+            ->authorizeChannel('private-family.'.$family, $data['socket_id']), true, flags: JSON_THROW_ON_ERROR);
+    }
+
     public function testActivate(Request $request, string $family): array
     {
         abort_unless($this->testEnabled(), 404);
@@ -124,6 +137,7 @@ final class HandoffApi
             abort_if(DB::table('family_members')->where('family_id', $id)->count() >= 2, 409, 'Both caregiver spots are filled.');
             DB::table('family_members')->insert(['family_id'=>$id,'user_id'=>$user]);
             DB::table('family_invites')->where('code_hash', $code)->update(['redeemed_at'=>now()]);
+            $this->notifyFamilyAfterCommit($id);
             return $this->familyState($family, $user);
         }, 3);
     }
@@ -139,14 +153,18 @@ final class HandoffApi
         ]);
         return DB::transaction(function () use ($request, $family, $data) {
             $actor = $request->user()->id;
-            $row = $this->memberFamily($family, $actor, true);
+            $row = $this->memberFamily($family, $actor, $data['changes'] !== []);
             $this->requireSync($row);
             abort_if($data['cursor'] > $row->revision, 422, 'Sync cursor is invalid for this family.');
+            $previousRevision = $row->revision;
             $results = [];
             foreach ($data['changes'] as $change) {
                 $results[] = $this->applyChange($row, $actor, $change);
             }
-            DB::table('families')->where('id', $family)->update(['revision'=>$row->revision]);
+            if ($row->revision !== $previousRevision) {
+                DB::table('families')->where('id', $family)->update(['revision'=>$row->revision]);
+                $this->notifyFamilyAfterCommit($family);
+            }
             $page = $this->events($family)->where('revision','>',$data['cursor'])->orderBy('revision')->limit(201)->get();
             $events = $page->take(200)->map(fn ($event) => $this->event($event));
             return [
@@ -248,6 +266,7 @@ final class HandoffApi
             }
             DB::table('handoffs')->insert($key + ['sender_id'=>$actor,'recipient_id'=>$recipient,
                 'snapshot'=>json_encode($snapshot, JSON_THROW_ON_ERROR),'note'=>$data['note'] ?? null,'created_at'=>now()]);
+            $this->notifyFamilyAfterCommit($family);
             return $this->handoff(DB::table('handoffs')->where($key)->first());
         }, 3);
     }
@@ -266,6 +285,7 @@ final class HandoffApi
                 $item->accepted_at = now()->toDateTimeString();
                 $query->update(['accepted_at'=>$item->accepted_at]);
                 DB::table('families')->where('id',$family)->update(['on_duty_id'=>$actor,'on_duty_since'=>$item->accepted_at]);
+                $this->notifyFamilyAfterCommit($family);
             }
             return $this->handoff($item);
         }, 3);
@@ -324,10 +344,31 @@ final class HandoffApi
         abort_unless($family->test_sync && $this->testEnabled(), 403, 'Family Sync is paused. Your local log is still available.');
     }
 
+    private function reverbKey(): ?string
+    {
+        return config('broadcasting.default') === 'reverb' ? config('broadcasting.connections.reverb.key') : null;
+    }
+
+    private function notifyFamilyAfterCommit(string $family): void
+    {
+        if ($this->reverbKey()) {
+            DB::afterCommit(function () use ($family) {
+                try {
+                    event(new FamilyChanged($family));
+                } catch (Throwable $error) {
+                    report($error);
+                }
+            });
+        }
+    }
+
     private function familyState(stdClass $family, int $actor): array
     {
+        $syncEnabled = (bool)$family->test_sync && $this->testEnabled();
+        $reverbKey = $syncEnabled ? $this->reverbKey() : null;
         return ['id'=>$family->id,'baby_name'=>$family->baby_name,'owner'=>(int)$family->owner_id === $actor,
-            'test_upgrade_available'=>$this->testEnabled(),'sync_enabled'=>(bool)$family->test_sync && $this->testEnabled(),
+            'test_upgrade_available'=>$this->testEnabled(),'sync_enabled'=>$syncEnabled,
+            ...($reverbKey ? ['realtime'=>['key'=>$reverbKey]] : []),
             'on_duty_id'=>(int)$family->on_duty_id,'on_duty_since'=>$this->iso($family->on_duty_since),
             'members'=>DB::table('family_members')->join('users','users.id','=','family_members.user_id')
                 ->where('family_id',$family->id)->orderBy('users.id')->get(['users.id','users.name'])];

@@ -15,6 +15,7 @@ Route::prefix('v1')->controller(HandoffApi::class)->group(function () {
         Route::post('invites/redeem', 'redeem');
         Route::prefix('families/{family}')->where(['family'=>'[0-9a-fA-F-]{36}'])->group(function () {
             Route::get('status', 'status');
+            Route::post('realtime/auth', 'realtimeAuth');
             Route::post('billing/test-activate', 'testActivate');
             Route::post('invites', 'invite');
             Route::post('sync', 'sync');
